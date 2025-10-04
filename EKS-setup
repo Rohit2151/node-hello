@@ -1,0 +1,106 @@
+#EKS Cluster Setup & Deployment Guide
+
+Overview
+--------
+This document guides you to create an AWS EKS cluster and deploy the `node-hello` sample app.
+It covers VPC, cluster creation with eksctl, IAM/IRSA, Helm addons (Ingress, cert-manager, monitoring, ArgoCD),
+ECR, CI/CD, Trivy scanning, and deployment steps.
+
+Prerequisites
+-------------
+- AWS account with permissions to create VPC, EKS, IAM, EC2, RDS, ECR.
+- Installed: aws, eksctl, kubectl, helm, docker, trivy.
+- Change region and placeholder values before running commands.
+- Default region in examples: ap-southeast-4
+1) Create EKS cluster with eksctl
+--------------------------------
+This creates VPC, subnets, nodegroup, and the EKS control plane.
+
+2) Associate OIDC provider 
+------------------------------------------------
+eksctl utils associate-iam-oidc-provider --region ap-southeast-4 --cluster project-eks-cluster --approve
+
+3) Create IAM policies and IRSA for components
+----------------------------------------------
+- Create policy for cluster-autoscaler
+- Create policy via `aws iam create-policy --policy-name ClusterAutoscalerPolicy --policy-document file://cluster-autoscaler-policy.json`
+- Create IRSA serviceaccount:
+
+eksctl create iamserviceaccount       --name cluster-autoscaler       --namespace kube-system       --cluster project-eks-cluster       --attach-policy-arn arn:aws:iam::123456123456:policy/ClusterAutoscalerPolicy       --approve       --override-existing-serviceaccounts       --region ap-southeast-4
+
+4) Install Helm addons
+----------------------
+- Ingress:
+  
+  helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+  helm repo update
+  helm install nginx-ingress ingress-nginx/ingress-nginx --namespace ingress-nginx --create-namespace \
+    --set controller.service.annotations."service\.beta\.kubernetes\.io/aws-load-balancer-scheme"=internet-facing \
+    --set controller.service.annotations."service\.beta\.kubernetes\.io/aws-load-balancer-type"=external
+  
+- cert-manager:
+  
+  helm repo add jetstack https://charts.jetstack.io
+  helm repo update
+  helm install cert-manager jetstack/cert-manager --namespace cert-manager --create-namespace --set installCRDs=true --version v1.15.0
+  
+  Apply cluster issuer:
+  kubectl apply -f k8s/cert-manager/cluster-issuer.yaml
+  
+- Prometheus:
+  
+  helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+  helm repo update
+  helm install prometheus prometheus-community/kube-prometheus-stack --namespace monitoring --create-namespace
+  
+- Loki + Grafana:
+  
+  helm repo add grafana https://grafana.github.io/helm-charts
+  helm repo update
+  helm upgrade --install loki grafana/loki-stack --namespace grafana-loki --create-namespace
+  
+- ArgoCD:
+  
+  helm repo add argo https://argoproj.github.io/argo-helm
+  helm repo update
+  helm install argocd argo/argo-cd --namespace argocd --create-namespace
+  
+5) Create namespaces
+--------------------
+kubectl apply -f k8s/namespace.yaml
+
+6) ECR repositories
+-------------------
+Create ECR repositories used by CI and deployments:
+
+aws ecr create-repository --repository-name node-hello --region ap-southeast-4
+
+
+7) Build, scan, push images (CI)
+--------------------------------
+CI will build and push images. Locally:
+
+docker build -t node-hello:latest .
+aws ecr get-login-password --region ap-southeast-4 | docker login --username AWS --password-stdin 123456123456.dkr.ecr.ap-southeast-4.amazonaws.com
+docker tag node-hello:latest 123456123456.dkr.ecr.ap-southeast-4.amazonaws.com/node-hello:latest
+docker push 123456123456.dkr.ecr.ap-southeast-4.amazonaws.com/node-hello:latest
+
+Scan images with Trivy:
+
+trivy image --severity CRITICAL,HIGH 123456123456.dkr.ecr.ap-southeast-4.amazonaws.com/node-hello:latest
+
+8) Deploy application manifests
+--------------------------------
+kubectl apply -f k8s/node-hello/ -n tex
+
+9) Verify Pods
+------------------
+
+kubectl get pods -n tex
+kubectl get svc -n tex
+kubectl get ingress -n tex
+
+
+10) Rollback a deployment
+-------------------------
+kubectl rollout undo deployment/node-hello -n tex
