@@ -1,0 +1,54 @@
+stages:
+  - build
+  - scan
+  - push
+  - deploy
+
+variables:
+  AWS_DEFAULT_REGION: "ap-southeast-4"
+  IMAGE_TAG: "$CI_COMMIT_SHORT_SHA"
+
+before_script:
+  - apk update && apk add --no-cache curl bash python3 py3-pip
+  - curl -LO "https://dl.k8s.io/release/v1.24.0/bin/linux/amd64/kubectl" && install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl || true
+  - pip3 install awscli
+  - aws configure set region "$AWS_DEFAULT_REGION"
+  - echo "$KUBECONFIG_CONTENTS" > ~/.kube/config || true
+
+build:
+  stage: build
+  script:
+    - docker build -t $ECR_REPO_NODE_HELLO:$IMAGE_TAG .
+  only:
+    - master
+
+trivy_scan:
+  stage: scan
+  image: aquasec/trivy:latest
+  script:
+    - trivy image --exit-code 1 --severity CRITICAL,HIGH $ECR_REPO_NODE_HELLO:$IMAGE_TAG || true
+  allow_failure: true
+  only:
+    - master
+
+push:
+  stage: push
+  script:
+    - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+    - docker tag $ECR_REPO_NODE_HELLO:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO_NODE_HELLO:$IMAGE_TAG
+    - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO_NODE_HELLO:$IMAGE_TAG
+  only:
+    - master
+
+deploy:
+  stage: deploy
+  script:
+    - aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_DEFAULT_REGION"
+    - envsubst < k8s/node-hello/deployment.yaml | kubectl apply -n tex -f -
+    - kubectl apply -f k8s/node-hello/service.yaml -n tex
+    - kubectl apply -f k8s/node-hello/ingress.yaml -n tex
+    - kubectl apply -f k8s/node-hello/hpa.yaml -n tex
+  environment:
+    name: production
+  only:
+    - master
